@@ -1,0 +1,6 @@
+{
+  "name": "one inverter — Commercial Quotation & Engineering Studio",
+  "description": "Commercial solar engineering system by one inverter, client project intake, appliance load sizing schedule, chronological PI serial quotations, automated BOQ generator, and commercial PDF export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
