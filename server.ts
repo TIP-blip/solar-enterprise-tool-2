@@ -4,8 +4,9 @@ import fs from "fs";
 import { fileURLToPath } from "url";
 import dotenv from "dotenv";
 import { createServer as createViteServer } from "vite";
-import { GoogleGenAI } from "@google/genai";
+import pkg from "pg";
 
+const { Pool } = pkg;
 dotenv.config();
 
 // Safe fallback for both development (tsx/ESM) and production (CJS bundle)
@@ -20,10 +21,18 @@ const PORT = Number(process.env.PORT) || 3000;
 const DATA_DIR = path.join(process.cwd(), "data");
 const DB_FILE = path.join(DATA_DIR, "db.json");
 
-// Ensure data directory exists
+// Ensure local data directory exists for fallback
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
+
+// PostgreSQL Connection Pool setup using Render's environment variable
+const pool = process.env.DATABASE_URL
+  ? new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: { rejectUnauthorized: false },
+    })
+  : null;
 
 interface DBData {
   clients: any[];
@@ -457,7 +466,45 @@ const defaultDB: DBData = {
   },
 };
 
+// Initialize database tables in Supabase if pool is active
+async function initPostgresDB() {
+  if (!pool) return;
+  try {
+    const client = await pool.connect();
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS erp_storage (
+        key VARCHAR(50) PRIMARY KEY,
+        data JSONB NOT NULL,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    // Check if initial row exists, if not insert defaultDB
+    const res = await client.query(
+      "SELECT key FROM erp_storage WHERE key = $1",
+      ["main_db"],
+    );
+    if (res.rows.length === 0) {
+      await client.query(
+        "INSERT INTO erp_storage (key, data) VALUES ($1, $2)",
+        ["main_db", JSON.stringify(defaultDB)],
+      );
+      console.log("Initialized Supabase erp_storage with default records.");
+    } else {
+      console.log("Supabase connected and tables verified.");
+    }
+    client.release();
+  } catch (err) {
+    console.error("Error initializing PostgreSQL database:", err);
+  }
+}
+
+// Synchronous wrapper compatibility layer for reading DB
 function readDB(): DBData {
+  // If pool is used, synchronous read isn't directly supported by 'pg',
+  // but for express handlers we can return default or cache.
+  // To keep code architecture smooth, let's implement async or cached sync read if using Postgres.
+  // Alternatively, let's use a cached global variable or fallback to JSON file locally.
   try {
     if (fs.existsSync(DB_FILE)) {
       const content = fs.readFileSync(DB_FILE, "utf-8");
@@ -465,18 +512,13 @@ function readDB(): DBData {
       return {
         ...defaultDB,
         ...parsed,
-        appliances:
-          parsed.appliances && parsed.appliances.length > 0
-            ? parsed.appliances
-            : defaultDB.appliances,
-        inventory:
-          parsed.inventory && parsed.inventory.length > 0
-            ? parsed.inventory
-            : defaultDB.inventory,
-        images:
-          parsed.images && parsed.images.length > 0
-            ? parsed.images
-            : defaultDB.images,
+        appliances: parsed.appliances?.length
+          ? parsed.appliances
+          : defaultDB.appliances,
+        inventory: parsed.inventory?.length
+          ? parsed.inventory
+          : defaultDB.inventory,
+        images: parsed.images?.length ? parsed.images : defaultDB.images,
         documents: parsed.documents || [],
         telemetry: parsed.telemetry || [],
         knowledgeBase: parsed.knowledgeBase || defaultDB.knowledgeBase,
@@ -484,7 +526,7 @@ function readDB(): DBData {
       };
     }
   } catch (err) {
-    console.error("Error reading db.json, using defaults:", err);
+    console.error("Error reading db.json:", err);
   }
   return defaultDB;
 }
@@ -492,8 +534,68 @@ function readDB(): DBData {
 function writeDB(data: DBData) {
   try {
     fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2), "utf-8");
+    if (pool) {
+      pool
+        .query(
+          `INSERT INTO erp_storage (key, data, updated_at) VALUES ($1, $2, CURRENT_TIMESTAMP)
+         ON CONFLICT (key) DO UPDATE SET data = EXCLUDED.data, updated_at = CURRENT_TIMESTAMP`,
+          ["main_db", JSON.stringify(data)],
+        )
+        .catch((err) => console.error("Async PG write error:", err));
+    }
   } catch (err) {
-    console.error("Error writing to db.json:", err);
+    console.error("Error writing database:", err);
+  }
+}
+
+// Asynchronous DB loader for PostgreSQL priority mode
+async function loadDBAsync(): Promise<DBData> {
+  if (pool) {
+    try {
+      const res = await pool.query(
+        "SELECT data FROM erp_storage WHERE key = $1",
+        ["main_db"],
+      );
+      if (res.rows.length > 0) {
+        const parsed = res.rows[0].data;
+        return {
+          ...defaultDB,
+          ...parsed,
+          appliances: parsed.appliances?.length
+            ? parsed.appliances
+            : defaultDB.appliances,
+          inventory: parsed.inventory?.length
+            ? parsed.inventory
+            : defaultDB.inventory,
+          images: parsed.images?.length ? parsed.images : defaultDB.images,
+          documents: parsed.documents || [],
+          telemetry: parsed.telemetry || [],
+          knowledgeBase: parsed.knowledgeBase || defaultDB.knowledgeBase,
+          settings: { ...defaultDB.settings, ...(parsed.settings || {}) },
+        };
+      }
+    } catch (err) {
+      console.error(
+        "Error fetching from PostgreSQL, falling back to local file:",
+        err,
+      );
+    }
+  }
+  return readDB();
+}
+
+async function saveDBAsync(data: DBData) {
+  fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2), "utf-8");
+  if (pool) {
+    try {
+      await pool.query(
+        `INSERT INTO erp_storage (key, data, updated_at) VALUES ($1, $2, CURRENT_TIMESTAMP)
+         ON CONFLICT (key) DO UPDATE SET data = EXCLUDED.data, updated_at = CURRENT_TIMESTAMP`,
+        ["main_db", JSON.stringify(data)],
+      );
+    } catch (err) {
+      console.error("Error saving to PostgreSQL:", err);
+    }
   }
 }
 
@@ -507,16 +609,22 @@ function formatRef(prefix: string, seq: number): string {
 }
 
 async function startServer() {
+  await initPostgresDB();
+
   const app = express();
   app.use(express.json({ limit: "25mb" }));
 
   // API Routes
   app.get("/api/health", (req, res) => {
-    res.json({ status: "ok", time: new Date().toISOString() });
+    res.json({
+      status: "ok",
+      time: new Date().toISOString(),
+      cloudStorage: !!pool,
+    });
   });
 
-  app.get("/api/references/next", (req, res) => {
-    const db = readDB();
+  app.get("/api/references/next", async (req, res) => {
+    const db = await loadDBAsync();
     const nextClientRef = formatRef("CL", db.settings.nextClientSeq || 101);
     const nextQuoteRef = formatRef("PI", db.settings.nextQuoteSeq || 7337);
     res.json({
@@ -528,13 +636,13 @@ async function startServer() {
     });
   });
 
-  app.get("/api/clients", (req, res) => {
-    const db = readDB();
+  app.get("/api/clients", async (req, res) => {
+    const db = await loadDBAsync();
     res.json(db.clients);
   });
 
-  app.post("/api/clients", (req, res) => {
-    const db = readDB();
+  app.post("/api/clients", async (req, res) => {
+    const db = await loadDBAsync();
     const clientData = req.body;
     const refNumber =
       clientData.refNumber || formatRef("CL", db.settings.nextClientSeq++);
@@ -557,17 +665,17 @@ async function startServer() {
     };
 
     db.clients.unshift(newClient);
-    writeDB(db);
+    await saveDBAsync(db);
     res.json(newClient);
   });
 
-  app.get("/api/quotes", (req, res) => {
-    const db = readDB();
+  app.get("/api/quotes", async (req, res) => {
+    const db = await loadDBAsync();
     res.json(db.quotes);
   });
 
-  app.get("/api/quotes/:id", (req, res) => {
-    const db = readDB();
+  app.get("/api/quotes/:id", async (req, res) => {
+    const db = await loadDBAsync();
     const quote = db.quotes.find(
       (q: any) => q.id === req.params.id || q.quoteNumber === req.params.id,
     );
@@ -577,8 +685,8 @@ async function startServer() {
     res.json(quote);
   });
 
-  app.post("/api/quotes", (req, res) => {
-    const db = readDB();
+  app.post("/api/quotes", async (req, res) => {
+    const db = await loadDBAsync();
     const payload = req.body;
 
     const quoteNumber =
@@ -683,13 +791,13 @@ async function startServer() {
     };
 
     db.quotes.unshift(newQuote);
-    writeDB(db);
+    await saveDBAsync(db);
 
     res.status(201).json(newQuote);
   });
 
-  app.delete("/api/quotes/:id", (req, res) => {
-    const db = readDB();
+  app.delete("/api/quotes/:id", async (req, res) => {
+    const db = await loadDBAsync();
     const initialLen = db.quotes.length;
     db.quotes = db.quotes.filter(
       (q: any) => q.id !== req.params.id && q.quoteNumber !== req.params.id,
@@ -697,24 +805,24 @@ async function startServer() {
     if (db.quotes.length === initialLen) {
       return res.status(404).json({ error: "Quotation not found" });
     }
-    writeDB(db);
+    await saveDBAsync(db);
     res.json({ success: true, message: "Quotation deleted successfully" });
   });
 
-  app.post("/api/settings", (req, res) => {
-    const db = readDB();
+  app.post("/api/settings", async (req, res) => {
+    const db = await loadDBAsync();
     db.settings = { ...db.settings, ...req.body };
-    writeDB(db);
+    await saveDBAsync(db);
     res.json(db.settings);
   });
 
-  app.get("/api/documents", (req, res) => {
-    const db = readDB();
+  app.get("/api/documents", async (req, res) => {
+    const db = await loadDBAsync();
     res.json(db.documents || []);
   });
 
-  app.post("/api/documents", (req, res) => {
-    const db = readDB();
+  app.post("/api/documents", async (req, res) => {
+    const db = await loadDBAsync();
     const doc = {
       ...req.body,
       id: req.body.id || `doc-${Date.now()}`,
@@ -723,17 +831,17 @@ async function startServer() {
     const idx = db.documents.findIndex((d: any) => d.id === doc.id);
     if (idx >= 0) db.documents[idx] = doc;
     else db.documents.unshift(doc);
-    writeDB(db);
+    await saveDBAsync(db);
     res.json(doc);
   });
 
-  app.delete("/api/documents/:id", (req, res) => {
-    const db = readDB();
+  app.delete("/api/documents/:id", async (req, res) => {
+    const db = await loadDBAsync();
     const before = db.documents.length;
     db.documents = db.documents.filter((d: any) => d.id !== req.params.id);
     if (before === db.documents.length)
       return res.status(404).json({ error: "Document not found" });
-    writeDB(db);
+    await saveDBAsync(db);
     res.json({ success: true });
   });
 
