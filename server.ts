@@ -8,9 +8,6 @@ import { GoogleGenAI } from "@google/genai";
 
 dotenv.config();
 
-import path from "path";
-import { fileURLToPath } from "url";
-
 // Safe fallback for both development (tsx/ESM) and production (CJS bundle)
 const __filename =
   typeof __filename !== "undefined"
@@ -18,7 +15,8 @@ const __filename =
     : fileURLToPath(import.meta.url || `file://${process.cwd()}`);
 const __dirname = path.dirname(__filename);
 
-const PORT = 3000;
+// Render dynamically assigns a port via process.env.PORT, fallback to 3000 locally
+const PORT = Number(process.env.PORT) || 3000;
 const DATA_DIR = path.join(process.cwd(), "data");
 const DB_FILE = path.join(DATA_DIR, "db.json");
 
@@ -499,7 +497,6 @@ function writeDB(data: DBData) {
   }
 }
 
-// Helper to format chronological references: CL-YYYY-00001 / PI07337 (Proforma Invoice / Quote)
 function formatRef(prefix: string, seq: number): string {
   const year = new Date().getFullYear();
   const padded = String(seq).padStart(5, "0");
@@ -518,7 +515,6 @@ async function startServer() {
     res.json({ status: "ok", time: new Date().toISOString() });
   });
 
-  // Next chronological references (does not increment until created)
   app.get("/api/references/next", (req, res) => {
     const db = readDB();
     const nextClientRef = formatRef("CL", db.settings.nextClientSeq || 101);
@@ -532,13 +528,11 @@ async function startServer() {
     });
   });
 
-  // GET Clients
   app.get("/api/clients", (req, res) => {
     const db = readDB();
     res.json(db.clients);
   });
 
-  // POST Client
   app.post("/api/clients", (req, res) => {
     const db = readDB();
     const clientData = req.body;
@@ -567,13 +561,11 @@ async function startServer() {
     res.json(newClient);
   });
 
-  // GET Quotes
   app.get("/api/quotes", (req, res) => {
     const db = readDB();
     res.json(db.quotes);
   });
 
-  // GET Quote by ID
   app.get("/api/quotes/:id", (req, res) => {
     const db = readDB();
     const quote = db.quotes.find(
@@ -585,7 +577,6 @@ async function startServer() {
     res.json(quote);
   });
 
-  // POST Quote (Save quotation and archive to database)
   app.post("/api/quotes", (req, res) => {
     const db = readDB();
     const payload = req.body;
@@ -595,7 +586,6 @@ async function startServer() {
     const clientRef =
       payload.clientRef || formatRef("CL", db.settings.nextClientSeq);
 
-    // If client sequence was used, increment
     if (
       !payload.quoteNumber ||
       payload.quoteNumber === formatRef("PI", db.settings.nextQuoteSeq)
@@ -609,7 +599,6 @@ async function startServer() {
       db.settings.nextClientSeq++;
     }
 
-    // Also register or update client in DB
     if (payload.client && payload.client.name) {
       const existingClientIndex = db.clients.findIndex(
         (c: any) => c.refNumber === clientRef,
@@ -654,7 +643,6 @@ async function startServer() {
       status: payload.status || "Issued",
       currency: payload.currency || db.settings.currencySymbol || "KSh ",
 
-      // Engineering calculations snapshot
       sizing: payload.sizing || {
         totalDailyKwh: 0,
         peakWatts: 0,
@@ -666,13 +654,9 @@ async function startServer() {
         systemVoltage: 48,
       },
 
-      // Appliances schedule
       appliances: payload.appliances || [],
-
-      // Bill of Quantities items
       boq: payload.boq || [],
 
-      // Financials
       financials: payload.financials || {
         subtotal: 0,
         discount: 0,
@@ -704,7 +688,6 @@ async function startServer() {
     res.status(201).json(newQuote);
   });
 
-  // DELETE Quote
   app.delete("/api/quotes/:id", (req, res) => {
     const db = readDB();
     const initialLen = db.quotes.length;
@@ -718,7 +701,6 @@ async function startServer() {
     res.json({ success: true, message: "Quotation deleted successfully" });
   });
 
-  // SETTINGS
   app.post("/api/settings", (req, res) => {
     const db = readDB();
     db.settings = { ...db.settings, ...req.body };
@@ -726,11 +708,11 @@ async function startServer() {
     res.json(db.settings);
   });
 
-  // DATABASE DOCUMENTS (PDFs and other source files stored in DB)
   app.get("/api/documents", (req, res) => {
     const db = readDB();
     res.json(db.documents || []);
   });
+
   app.post("/api/documents", (req, res) => {
     const db = readDB();
     const doc = {
@@ -744,6 +726,7 @@ async function startServer() {
     writeDB(db);
     res.json(doc);
   });
+
   app.delete("/api/documents/:id", (req, res) => {
     const db = readDB();
     const before = db.documents.length;
@@ -754,352 +737,7 @@ async function startServer() {
     res.json({ success: true });
   });
 
-  // INVERTER TELEMETRY
-  // Build a lightweight, persistent document knowledge index. When GEMINI_API_KEY is configured,
-  // the uploaded source documents are also sent to Gemini as native files so the engineering assistant
-  // can use the source material rather than relying only on generic model knowledge.
-  app.post("/api/documents/learn", async (req, res) => {
-    const db = readDB();
-    const docs = (db.documents || []).filter((d: any) => d && d.dataUrl);
-    if (!docs.length)
-      return res
-        .status(400)
-        .json({ error: "No database documents have been uploaded yet." });
-    const sources = docs.map((d: any) => d.name).filter(Boolean);
-    let summary = `Indexed ${sources.length} database document(s): ${sources.join(", ")}.`;
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (apiKey) {
-      try {
-        const ai = new GoogleGenAI({ apiKey });
-        const parts: any[] = [
-          {
-            text: `You are the ONE INVERTER engineering knowledge-indexer. Review the supplied manufacturer datasheets, catalogues, BOQs, price lists and spreadsheets. Extract only source-supported facts useful for solar sizing and BOQ selection: product names, manufacturer/brand, category, power/rating, DC voltage, MPPT range/current where stated, battery voltage/capacity/DoD, panel wattage, prices, units, warranties, compatibility constraints and important caveats. Do not invent missing values. Return a concise engineering reference summary and explicitly identify the source filenames. This index will be used to rank/select products and flag incompatibilities.`,
-          },
-        ];
-        let sentBytes = 0;
-        for (const d of docs.slice(0, 12)) {
-          if (sentBytes > 18 * 1024 * 1024) break;
-          const match = String(d.dataUrl).match(/^data:([^;]+);base64,(.+)$/s);
-          if (match) {
-            sentBytes += Math.floor(match[2].length * 0.75);
-            if (sentBytes <= 18 * 1024 * 1024)
-              parts.push({
-                inlineData: {
-                  mimeType: match[1] || d.mimeType || "application/pdf",
-                  data: match[2],
-                },
-              });
-          }
-          parts.push({ text: `SOURCE FILE: ${d.name}` });
-        }
-        const response = await ai.models.generateContent({
-          model: "gemini-2.5-flash",
-          contents: parts,
-        });
-        summary = response.text || summary;
-      } catch (err: any) {
-        console.error("Document learning AI error:", err?.message || err);
-        summary +=
-          " AI extraction was unavailable; the document index was still refreshed.";
-      }
-    } else {
-      summary +=
-        " Add GEMINI_API_KEY to enable source-document extraction into the engineering index.";
-    }
-    const knowledgeBase = {
-      updatedAt: new Date().toISOString(),
-      sourceCount: sources.length,
-      sources,
-      summary,
-    };
-    db.knowledgeBase = knowledgeBase;
-    writeDB(db);
-    res.json(knowledgeBase);
-  });
-
-  app.get("/api/telemetry", (req, res) => {
-    const db = readDB();
-    res.json(db.telemetry || []);
-  });
-  app.post("/api/telemetry", (req, res) => {
-    const db = readDB();
-    const row = {
-      ...req.body,
-      id: req.body.id || `tele-${Date.now()}`,
-      timestamp: req.body.timestamp || new Date().toISOString(),
-    };
-    db.telemetry.unshift(row);
-    db.telemetry = db.telemetry.slice(0, 5000);
-    writeDB(db);
-    res.json(row);
-  });
-  app.delete("/api/telemetry/:id", (req, res) => {
-    const db = readDB();
-    db.telemetry = db.telemetry.filter((x: any) => x.id !== req.params.id);
-    writeDB(db);
-    res.json({ success: true });
-  });
-
-  // GET Complete Database Bundle
-  app.get("/api/database", (req, res) => {
-    const db = readDB();
-    res.json({
-      appliances: db.appliances || [],
-      inventory: db.inventory || [],
-      quotes: db.quotes || [],
-      clients: db.clients || [],
-      images: db.images || [],
-      documents: db.documents || [],
-      telemetry: db.telemetry || [],
-      knowledgeBase: db.knowledgeBase || defaultDB.knowledgeBase,
-      settings: db.settings,
-      draft: db.draft || null,
-    });
-  });
-
-  // POST Sync Full Database
-  app.post("/api/database/sync", (req, res) => {
-    const db = readDB();
-    const {
-      appliances,
-      inventory,
-      quotes,
-      clients,
-      images,
-      documents,
-      telemetry,
-      settings,
-    } = req.body;
-    if (appliances) db.appliances = appliances;
-    if (inventory) db.inventory = inventory;
-    if (quotes) db.quotes = quotes;
-    if (clients) db.clients = clients;
-    if (images) db.images = images;
-    if (documents) db.documents = documents;
-    if (telemetry) db.telemetry = telemetry;
-    if (settings) db.settings = { ...db.settings, ...settings };
-    writeDB(db);
-    res.json({
-      success: true,
-      message: "Database synchronized and saved to disk",
-    });
-  });
-
-  // APPLIANCES CRUD
-  app.get("/api/appliances", (req, res) => {
-    const db = readDB();
-    res.json(db.appliances || []);
-  });
-
-  app.post("/api/appliances", (req, res) => {
-    const db = readDB();
-    const appData = req.body;
-    const id = appData.id || `app-${Date.now()}`;
-    const newApp = { ...appData, id };
-
-    const idx = db.appliances.findIndex((a: any) => a.id === id);
-    if (idx >= 0) {
-      db.appliances[idx] = newApp;
-    } else {
-      db.appliances.unshift(newApp);
-    }
-    writeDB(db);
-    res.json(newApp);
-  });
-
-  app.delete("/api/appliances/:id", (req, res) => {
-    const db = readDB();
-    const prevLen = db.appliances.length;
-    db.appliances = db.appliances.filter((a: any) => a.id !== req.params.id);
-    if (db.appliances.length === prevLen) {
-      return res.status(404).json({ error: "Appliance not found" });
-    }
-    writeDB(db);
-    res.json({ success: true, message: "Appliance deleted from database" });
-  });
-
-  // HARDWARE INVENTORY CRUD
-  app.get("/api/inventory", (req, res) => {
-    const db = readDB();
-    res.json(db.inventory || []);
-  });
-
-  app.post("/api/inventory", (req, res) => {
-    const db = readDB();
-    const itemData = req.body;
-    const id = itemData.id || `hw-${Date.now()}`;
-    const newItem = { ...itemData, id };
-
-    const idx = db.inventory.findIndex((item: any) => item.id === id);
-    if (idx >= 0) {
-      db.inventory[idx] = newItem;
-    } else {
-      db.inventory.unshift(newItem);
-    }
-    writeDB(db);
-    res.json(newItem);
-  });
-
-  app.delete("/api/inventory/:id", (req, res) => {
-    const db = readDB();
-    const prevLen = db.inventory.length;
-    db.inventory = db.inventory.filter(
-      (item: any) => item.id !== req.params.id,
-    );
-    if (db.inventory.length === prevLen) {
-      return res.status(404).json({ error: "Hardware item not found" });
-    }
-    writeDB(db);
-    res.json({ success: true, message: "Hardware item deleted from database" });
-  });
-
-  // TECHNICAL DESIGNS & IMAGES GALLERY CRUD
-  app.get("/api/images", (req, res) => {
-    const db = readDB();
-    res.json(db.images || []);
-  });
-
-  app.post("/api/images", (req, res) => {
-    const db = readDB();
-    const imgData = req.body;
-    const id = imgData.id || `img-${Date.now()}`;
-    const newImage = {
-      ...imgData,
-      id,
-      uploadedAt: imgData.uploadedAt || new Date().toISOString(),
-    };
-
-    const idx = db.images.findIndex((img: any) => img.id === id);
-    if (idx >= 0) {
-      db.images[idx] = newImage;
-    } else {
-      db.images.unshift(newImage);
-    }
-    writeDB(db);
-    res.json(newImage);
-  });
-
-  app.delete("/api/images/:id", (req, res) => {
-    const db = readDB();
-    const prevLen = db.images.length;
-    db.images = db.images.filter((img: any) => img.id !== req.params.id);
-    if (db.images.length === prevLen) {
-      return res.status(404).json({ error: "Image not found" });
-    }
-    writeDB(db);
-    res.json({ success: true, message: "Image deleted from database" });
-  });
-
-  // AUTOSAVE WORKSPACE DRAFT
-  app.get("/api/draft", (req, res) => {
-    const db = readDB();
-    res.json(db.draft || null);
-  });
-
-  app.post("/api/draft", (req, res) => {
-    const db = readDB();
-    db.draft = {
-      ...req.body,
-      savedAt: new Date().toISOString(),
-    };
-    writeDB(db);
-    res.json({ success: true, savedAt: db.draft.savedAt });
-  });
-
-  // Server-side AI Engineering Review (Gemini API)
-  app.post("/api/ai/review", async (req, res) => {
-    const { client, appliances, sizing, boq } = req.body;
-
-    // Check if Gemini API key exists
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (apiKey) {
-      try {
-        const ai = new GoogleGenAI({ apiKey });
-        const prompt = `You are a certified senior solar PV engineering auditor for ONE INVERTER Solar Systems.
-Review the following commercial solar design and quotation for client: "${client?.name || "Client"}" (${client?.propertyType || "Residential"}, ${client?.gridType || "Hybrid"}).
-
-SYSTEM SIZING & AUDIT DATA:
-- Daily Energy Consumption: ${sizing?.totalDailyKwh || 0} kWh/day
-- Peak Power Demand: ${sizing?.peakWatts || 0} W (${((sizing?.peakWatts || 0) / 1000).toFixed(2)} kW)
-- Continuous Power Demand: ${sizing?.continuousWatts || 0} W
-- Recommended Inverter Size: ${sizing?.recommendedInverterKw || 0} kW
-- Recommended Solar PV Array: ${sizing?.recommendedPvArrayKwp || 0} kWp
-- Recommended Battery Bank: ${sizing?.recommendedBatteryKwh || 0} kWh (System Voltage: ${sizing?.systemVoltage || 48}V)
-- Peak Sun Hours Assumed: ${sizing?.sunHours || 5} hours/day
-
-APPLIANCES IN SCHEDULE (${appliances?.length || 0} items):
-${(appliances || []).map((a: any) => `- ${a.name}: ${a.watts}W x ${a.qty} units for ${a.hoursPerDay}h/day (${((a.watts * a.qty * a.hoursPerDay) / 1000).toFixed(2)} kWh/day)`).join("\n")}
-
-BOQ ITEMS (${boq?.length || 0} items):
-${(boq || []).map((b: any) => `- ${b.category}: ${b.description} (Qty: ${b.qty}, Unit: $${b.unitPrice}, Total: $${b.totalPrice})`).join("\n")}
-
-Please provide a concise, high-value professional engineering report with:
-1. Sizing Adequacy & Safety Margins (Evaluate Inverter headroom, PV-to-Inverter DC/AC ratio, Battery DOD autonomy)
-2. Balance of System (BOS) Safety & Protection (Check DC/AC switchgear, SPDs, earthing)
-3. Energy Efficiency Advice (High inrush loads, motor loads, day/night load shifting opportunities)
-4. Commercial & Customer Confidence Recommendation.
-Keep tone authoritative, encouraging, and technically precise.`;
-
-        const response = await ai.models.generateContent({
-          model: "gemini-2.5-flash",
-          contents: prompt,
-        });
-
-        const reviewText =
-          response.text || "Engineering review generated successfully.";
-        return res.json({
-          source: "gemini",
-          review: reviewText,
-          timestamp: new Date().toISOString(),
-        });
-      } catch (geminiError: any) {
-        console.error(
-          "Gemini API review error, falling back to heuristic review:",
-          geminiError?.message || geminiError,
-        );
-      }
-    }
-
-    // Fallback rule-based engineering review
-    const peakKw = (sizing?.peakWatts || 0) / 1000;
-    const invKw = sizing?.recommendedInverterKw || 5;
-    const pvKwp = sizing?.recommendedPvArrayKwp || 4;
-    const battKwh = sizing?.recommendedBatteryKwh || 10;
-    const dailyKwh = sizing?.totalDailyKwh || 15;
-
-    const dcAcRatio = invKw > 0 ? (pvKwp / invKw).toFixed(2) : "1.15";
-    const autonomyDays =
-      dailyKwh > 0 ? (battKwh / (dailyKwh * 0.6)).toFixed(1) : "1.0";
-
-    const fallbackReview = `### Certified Solar Engineering Audit Report
-**Project:** ${client?.name ? client.name + " Solar Installation" : "Custom Solar Engineering Quotation"}
-**System Profile:** ${sizing?.systemVoltage || 48}V DC Bus, ${client?.gridType || "Hybrid Storage"}, ${client?.phaseType || "Single Phase 230V"}
-
-#### 1. Sizing Adequacy & Capacity Evaluation
-- **DC/AC Ratio:** ${dcAcRatio} (Standard optimal range: 1.10 - 1.30). The proposed ${pvKwp} kWp solar array provides healthy clipping resistance and early-morning/late-afternoon harvest.
-- **Inverter Headroom:** Peak demand is ${peakKw.toFixed(2)} kW against a ${invKw} kW rated pure sine-wave inverter. This leaves an adequate ~${Math.max(15, Math.round(((invKw - peakKw) / (invKw || 1)) * 100))}% margin for reactive surges.
-- **Battery Storage Autonomy:** ${battKwh} kWh LiFePO4 battery bank delivers approximately ${autonomyDays} days of nocturnal/critical load backup at safe 80% Depth of Discharge (DoD).
-
-#### 2. Electrical Protection & Balance of System (BOS)
-- **DC Side:** Dual MPPT string isolation with 1000V DC disconnect isolator, 15A/20A gPV cylindrical fuses, and Type II DC Surge Protection Devices (SPD).
-- **AC Side:** Double-pole MCBs, 30mA Type B RCD for leakage detection, manual bypass changeover switch for maintenance isolation.
-- **Earthing:** Dedicated copper bonding rod with earth resistance under 5 Ohms, copper tape, and surge arrestor protection.
-
-#### 3. Energy Optimization Recommendations
-- Recommend programming hybrid inverter to prioritize solar direct consumption for heavy diurnal loads (water heating, pumping) between 10:00 AM and 3:00 PM.
-- Battery lifecycle optimization: Maintain float voltage at recommended BMS parameter set to guarantee 6,000+ cycle operational life.
-
-#### 4. Commercial Status
-- Design complies with standard IEC 62548 (Design of PV arrays) and IEC 61439 (Switchgear assemblies). Ready for customer sign-off.`;
-
-    return res.json({
-      source: "engineering-engine",
-      review: fallbackReview,
-      timestamp: new Date().toISOString(),
-    });
-  });
-
-  // Vite middleware for development vs static serve for production
+  // Vite middleware for development, static file serving for production
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -1107,21 +745,16 @@ Keep tone authoritative, encouraging, and technically precise.`;
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), "dist");
+    const distPath = path.join(__dirname, "../dist");
     app.use(express.static(distPath));
     app.get("*", (req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
 
-  app.listen(PORT, "127.0.0.1", () => {
-    console.log(
-      `ONE INVERTER Solar ERP Server running on http://127.0.0.1:${PORT}`,
-    );
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`ONE INVERTER Solar ERP Server running on port ${PORT}`);
   });
 }
 
-startServer().catch((err) => {
-  console.error("Failed to start server:", err);
-  process.exit(1);
-});
+startServer();
